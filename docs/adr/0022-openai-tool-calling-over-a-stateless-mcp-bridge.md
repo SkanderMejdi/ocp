@@ -88,7 +88,10 @@ with `buildCliArgs`' own bridge argv and a prompt asking for two calls at once: 
 blocks arrive as separate `assistant` events, **each with `stop_reason: null`**, all sharing one
 `message.id`, followed by the `message_delta`. So every call is now accumulated and the spawn ends
 on the signal rather than on the first call; a fail-safe delivers whatever was collected if the
-signal never arrives, logged as `signalMissing`. Streaming delivers each call whole in one delta chunk keyed by
+signal never arrives, logged as `signalMissing`. That fail-safe's window measures stream silence:
+each `tool_use` and content-block event re-arms it, because a window counted from the first call
+cut off a second call whose arguments took longer than the budget to write. A message that never
+stops writing is bounded by `CLAUDE_TIMEOUT` instead. Streaming delivers each call whole in one delta chunk keyed by
 `index`, which is a valid instance of the spec's chunked form. The `tool_call_id` the client echoes
 back is the CLI's own `tool_use.id` where it gave one.
 

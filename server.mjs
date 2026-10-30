@@ -437,6 +437,18 @@ function parseStreamJsonEvent(event, sawTextDelta) {
   return null;
 }
 
+// True for the stream events that prove the model is still writing the current message, which is
+// what may hold the tool-turn window open. A CLOSED list on purpose, so an event type this code has
+// never seen cannot hold it open: only a block event is positive evidence of more content. `ping`
+// is the known case -- the 2.1.314 bundle can synthesize one every 30 s while the upstream is
+// silent (read from the bundle, not observed on stdout), which is liveness of the CLI, not of the
+// model. `message_delta` says the message is ending, not that more is coming.
+function isContentBlockProgress(event) {
+  if (event?.type !== "stream_event") return false;
+  const innerType = (event.event ?? event)?.type;
+  return innerType === "content_block_start" || innerType === "content_block_delta" || innerType === "content_block_stop";
+}
+
 // ── Configuration ───────────────────────────────────────────────────────
 // Settings marked with `let` can be changed at runtime via PATCH /settings.
 const PORT = parseInt(process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT), 10);
@@ -453,17 +465,20 @@ const SKIP_PERMISSIONS = process.env.CLAUDE_SKIP_PERMISSIONS === "true";
 // nobody tests.
 let TOOL_CALLING = process.env.OCP_TOOL_CALLING !== "0";
 
-// How long after a tool_use block to wait for the message-end signal before ending the turn anyway.
-// MEASURED on claude 2.1.270: the two tool_use events of a parallel message arrive ~100 ms apart and
-// the `message_delta` immediately after the second, so 2 s is ~20x the observed gap. It is a CEILING
-// on the fallback, not a target -- the healthy path never reaches it, because the signal arrives
-// first and clears the timer.
+// How long the stream may stay SILENT, once a tool_use is in hand, before the turn ends without the
+// message-end signal. Each content-block event re-arms it (see isContentBlockProgress), so the time
+// a block takes to write does not count against it: only a gap does. MEASURED: on claude 2.1.270 a
+// small second call's tool_use event arrives ~100 ms after the first; on 2.1.314 with sonnet a
+// second call of 5500-5900 characters took 16-18 s to finish, with no gap over 866 ms in six runs,
+// so the default is ~2.3x the largest gap seen. The budget bounds ONE gap on the fallback, not the
+// whole wait, and it is not a target -- the healthy path never reaches it, because the signal
+// arrives first and clears the timer.
 //
-// EXPIRY: this number is only meaningful while the CLI emits per-content-block events at roughly
-// that cadence. If a future build batches or streams them much slower, a parallel call could be
-// truncated again -- SILENTLY, because the fallback answers rather than fails. The guard against
-// that is the `endedOn` field on every openai_tool_calls log line: a run of "quiescence" where
-// "signal" used to be is the signal to re-measure, and it is why that field is logged at `warn`.
+// EXPIRY: this number is only meaningful while the gaps BETWEEN events stay under it. If a future
+// build batches events, or the model pauses longer than this between two blocks, a parallel call
+// could be truncated again -- SILENTLY, because the fallback answers rather than fails. The guard
+// against that is the `endedOn` field on every openai_tool_calls log line: a run of "quiescence"
+// where "signal" used to be is the signal to re-measure, and it is why that field is logged at `warn`.
 const TOOL_TURN_QUIESCE_MS = parseIntEnv("OCP_TOOL_TURN_QUIESCE_MS", 2000);
 const ALLOWED_TOOLS = (process.env.CLAUDE_ALLOWED_TOOLS ||
   "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,Agent"
@@ -2451,16 +2466,18 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
     let toolText = "";
     // #478: tool_use blocks ACCUMULATE and the turn ends on the message-end signal, not on the
     // first call. The CLI emits one `assistant` event per content block, so a message carrying two
-    // parallel calls arrives as two events ~100 ms apart; ending on the first handed the client
-    // 1 of N and the model re-issued the rest next turn -- converging, at one wasted round trip
-    // each, with a history that diverged from what the model actually emitted.
+    // parallel calls arrives as two events, ~100 ms apart when the second is small and many
+    // seconds apart when it is large; ending on the first handed the client 1 of N and the model
+    // re-issued the rest next turn -- converging, at one wasted round trip each, with a history
+    // that diverged from what the model actually emitted.
     const pendingToolUses = [];
     let pendingToolText = "";
     let toolQuiesceTimer = null;
     // ONE ending, two triggers, so the two cannot drift apart. `reason` is logged because the
     // difference is operationally load-bearing: "signal" is the healthy path, and a run of
-    // "quiescence" means the CLI stopped emitting the stop reason and this build is one release
-    // away from having no end signal at all.
+    // "quiescence" means either the CLI stopped emitting the stop reason, leaving this build one
+    // release away from having no end signal at all, or the stream fell silent mid-message for
+    // longer than the budget.
     //
     // THE `toolCalls` CHECK BELOW IS NOT INDEPENDENTLY PINNED, and that is recorded rather than
     // dressed up. Three things stop the timer double-counting a turn the signal already ended: this
@@ -2470,7 +2487,9 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
     // still never fired, because ending the turn kills the spawn and the close handler clears it
     // before the budget elapses. Keep it as the cheap third line; do not claim a row for it.
     const endToolTurn = (reason) => {
-      if (toolCalls || !opts.tools || !pendingToolUses.length) return;
+      // `timedOut`: the request is already answered, and a child that survives SIGTERM can still
+      // reach either trigger. An open window at the timeout is the normal state of a long message.
+      if (toolCalls || timedOut || !opts.tools || !pendingToolUses.length) return;
       if (toolQuiesceTimer) { clearTimeout(toolQuiesceTimer); toolQuiesceTimer = null; }
       toolCalls = pendingToolUses.slice();
       toolText = pendingToolText || assembledText;
@@ -2482,6 +2501,13 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
       // #474: the whole group — a grandchild holding the pipe would otherwise keep 'close' pending.
       killChildTree(proc, "SIGTERM");
       scheduleKillEscalation(proc, killChildTree); // #500
+    };
+    const armToolQuiesce = () => {
+      if (toolQuiesceTimer) clearTimeout(toolQuiesceTimer);
+      toolQuiesceTimer = setTimeout(() => {
+        endToolTurn("quiescence");
+      }, TOOL_TURN_QUIESCE_MS);
+      if (typeof toolQuiesceTimer.unref === "function") toolQuiesceTimer.unref();
     };
 
     proc.stdout.on("data", (d) => {
@@ -2496,6 +2522,11 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
       const { events, remainder } = parseStreamJsonLines(lineBuffer);
       lineBuffer = remainder;
       for (const event of events) {
+        // A non-null timer means a tool_use is in hand and no turn has been recorded. It can
+        // outlive the request: endToolTurn refuses that after a timeout, but not after an is_error
+        // result, where its kill is what ends a child that stayed alive, at the cost of a
+        // `quiescence` log line and a toolCallsEmitted count for a request that failed.
+        if (toolQuiesceTimer && isContentBlockProgress(event)) armToolQuiesce();
         const parsed = parseStreamJsonEvent(event, sawTextDelta);
         if (!parsed) continue;
         if (parsed.toolUses) {
@@ -2524,14 +2555,12 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
             // flag's name and not the contract the flag exists for.
             //
             // So: once a call is in hand, the turn ends either on the signal or on quiescence,
-            // whichever comes first. The fallback then costs a bounded delay instead of a timeout,
-            // and delivers at least what 3.34.0 delivered.
-            if (!toolQuiesceTimer) {
-              toolQuiesceTimer = setTimeout(() => {
-                endToolTurn("quiescence");
-              }, TOOL_TURN_QUIESCE_MS);
-              if (typeof toolQuiesceTimer.unref === "function") toolQuiesceTimer.unref();
-            }
+            // whichever comes first. Quiescence is SILENCE: every tool_use and content-block event
+            // re-arms it, so a later block is not cut off while its events keep arriving. The
+            // fallback then costs a bounded delay after the stream stops. A message that never
+            // stops writing is bounded by CLAUDE_TIMEOUT instead, and fails rather than answering
+            // with 1 of N.
+            armToolQuiesce();
             // The tool event's own text is empty whenever the preamble arrived as its own block
             // (measured), so this is additive rather than an assignment, and `assembledText` is the
             // fallback below -- between them the preamble survives either shape.

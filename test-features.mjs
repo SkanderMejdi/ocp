@@ -3202,6 +3202,42 @@ if [ -n "$TOOL_USE_PARALLEL" ]; then
   fi
   exec sleep 120
 fi
+if [ -n "$TOOL_USE_SLOW_SECOND" ]; then
+  # The block order measured on 2.1.270 (see parseStreamJsonEvent), slowed down: every gap is under
+  # the quiescence budget and their sum is well over it, which is what a large second call looks like.
+  printf '%s\\n' '{"type":"assistant","message":{"id":"msg_fake01","stop_reason":null,"content":[{"type":"tool_use","id":"toolu_fakeA","name":"mcp__ocp__lookup_build_id","input":{"project":"alpha"}}]}}'
+  sleep "$TOOL_USE_SLOW_SECOND"
+  printf '%s\\n' '{"type":"stream_event","event":{"type":"content_block_stop","index":0}}'
+  sleep "$TOOL_USE_SLOW_SECOND"
+  printf '%s\\n' '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_fakeB","name":"mcp__ocp__lookup_deploy_id","input":{}}}}'
+  sleep "$TOOL_USE_SLOW_SECOND"
+  printf '%s\\n' '{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"project\\":"}}}'
+  sleep "$TOOL_USE_SLOW_SECOND"
+  printf '%s\\n' '{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\\"alpha\\"}"}}}'
+  sleep "$TOOL_USE_SLOW_SECOND"
+  printf '%s\\n' '{"type":"assistant","message":{"id":"msg_fake01","stop_reason":null,"content":[{"type":"tool_use","id":"toolu_fakeB","name":"mcp__ocp__lookup_deploy_id","input":{"project":"alpha"}}]}}'
+  sleep "$TOOL_USE_SLOW_SECOND"
+  printf '%s\\n' '{"type":"stream_event","event":{"type":"content_block_stop","index":1}}'
+  if [ -z "$TOOL_USE_NO_END_SIGNAL" ]; then
+    printf '%s\\n' '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null}}}'
+  fi
+  exec sleep 120
+fi
+if [ -n "$TOOL_USE_THEN_REPEAT" ]; then
+  # One call, then the given stream line forever: the stream stays busy and the message never ends.
+  # With TOOL_USE_SURVIVE_TERM the shell and its sleeps ignore SIGTERM, so only the SIGKILL ends it.
+  if [ -n "$TOOL_USE_SURVIVE_TERM" ]; then trap '' TERM; fi
+  printf '%s\\n' '{"type":"assistant","message":{"id":"msg_fake01","stop_reason":null,"content":[{"type":"tool_use","id":"toolu_fakeA","name":"mcp__ocp__lookup_build_id","input":{"project":"alpha"}}]}}'
+  # TOOL_USE_REPEAT_COUNT stops the lines there and leaves the process alive and silent.
+  i=0
+  while [ -z "$TOOL_USE_REPEAT_COUNT" ] || [ "$i" -lt "$TOOL_USE_REPEAT_COUNT" ]; do
+    printf '%s\\n' "$TOOL_USE_THEN_REPEAT"
+    sleep 0.2
+    i=$((i + 1))
+  done
+  if [ -n "$TOOL_USE_FINAL_LINE" ]; then printf '%s\\n' "$TOOL_USE_FINAL_LINE"; fi
+  exec sleep 120
+fi
 if [ -n "$FAKE_USAGE_EVENTS" ]; then
   # #512: the two events that carry what a spawn cost, in the shape claude 2.1.280 emits them
   # (captured 2026-09-25 from a real -p call; numbers kept, uuids and session ids dropped).
@@ -8007,6 +8043,129 @@ ltTest("integration (#478): with NO end signal the calls arrive on a BOUNDED wai
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "parallel-nosignal", 8000); }
   } finally { _ltRmRetry(dir); }
 });
+
+// The window measures SILENCE, not time since the first call. A second call whose arguments take
+// longer to write than the budget is not a stalled stream, and ending the turn there hands the
+// client 1 of N with no error. 800 ms gaps against a 1500 ms budget: each gap fits with room for a
+// slow host, and any two adjacent gaps do not, so dropping any ONE event kind reddens this test.
+ltTest("integration (quiescence): a second call slower than the budget still arrives, and the turn ends on the signal", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, TOOL_USE_SLOW_SECOND: "0.8", OCP_TOOL_TURN_QUIESCE_MS: "1500", CLAUDE_TIMEOUT: "30000" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const t0 = Date.now();
+      const r = await ltPostStatus(port, { model: "sonnet", tools: PAR_TOOLS, messages: [{ role: "user", content: "both please" }] });
+      const took = Date.now() - t0;
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      const msg = JSON.parse(r.text).choices[0].message;
+      assert.equal(msg.tool_calls.length, 2, `a slow second call must not be truncated — got ${JSON.stringify(msg.tool_calls)}`);
+      assert.deepEqual(msg.tool_calls.map((c) => c.id), ["toolu_fakeA", "toolu_fakeB"]);
+      // Without this the test could pass on a fixture that outran the budget it exists to exceed.
+      assert.ok(took >= 4500, `the message must outlast the budget several times over — took ${took} ms`);
+      assert.match(buf.out, /"endedOn":"signal"/, `— ${buf.out.slice(-400)}`);
+      assert.doesNotMatch(buf.err, /"endedOn":"quiescence"/, `— ${buf.err.slice(-400)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "slow-second", 8000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The degraded path with the arming call alone: a stream that goes quiet right after one call.
+ltTest("integration (quiescence): a stream that goes silent after one call ends within the budget", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, TOOL_USE_NAME: "lookup_build_id", TOOL_USE_NO_END_SIGNAL: "1", OCP_TOOL_TURN_QUIESCE_MS: "1000", CLAUDE_TIMEOUT: "30000" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const t0 = Date.now();
+      const r = await ltPostStatus(port, { model: "sonnet", tools: PAR_TOOLS, messages: [{ role: "user", content: "one please" }] });
+      const took = Date.now() - t0;
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      assert.equal(JSON.parse(r.text).choices[0].message.tool_calls.length, 1);
+      assert.ok(took >= 1000 && took < 10000, `the budget must be spent and bound the wait — took ${took} ms`);
+      assert.match(buf.err, /"endedOn":"quiescence"/, `— ${buf.err.slice(-400)}`);
+      assert.match(buf.err, /"signalMissing":true/, `— ${buf.err.slice(-400)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "silent-after-one", 8000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// A busy stream is not a progressing one: only a content-block event may hold the window open. Each
+// line repeats every 200 ms against a 1 s budget, so one that re-armed would reach CLAUDE_TIMEOUT.
+for (const [label, line] of [
+  ["ping", '{"type":"stream_event","event":{"type":"ping"}}'],
+  ["message_delta", '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":null}}}'],
+  ["unknown", '{"type":"stream_event","event":{"type":"future_event"}}'],
+]) {
+  ltTest(`integration (quiescence): ${label} events do not hold the window open`, async () => {
+    if (!LT_POSIX) return;
+    const dir = ltMkdir(); const fake = ltFake(dir);
+    try {
+      const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, TOOL_USE_THEN_REPEAT: line, OCP_TOOL_TURN_QUIESCE_MS: "1000", CLAUDE_TIMEOUT: "8000" }, dir);
+      try {
+        assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+        const t0 = Date.now();
+        const r = await ltPostStatus(port, { model: "sonnet", tools: PAR_TOOLS, messages: [{ role: "user", content: "one please" }] });
+        const took = Date.now() - t0;
+        assert.equal(r.status, 200, `${label} must not push the turn into CLAUDE_TIMEOUT — ${r.text.slice(0, 200)}`);
+        assert.equal(JSON.parse(r.text).choices[0].message.tool_calls.length, 1);
+        assert.ok(took >= 1000 && took < 6000, `took ${took} ms`);
+        assert.match(buf.err, /"endedOn":"quiescence"/, `— ${buf.err.slice(-400)}`);
+      } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, `${label}-loop`, 8000); }
+    } finally { _ltRmRetry(dir); }
+  });
+}
+
+// The re-arm has no ceiling of its own, so a message that never stops writing is bounded by
+// CLAUDE_TIMEOUT alone. Stated here because "the wait is bounded" is the claim #478 was merged on.
+ltTest("integration (quiescence): a message that never stops writing is bounded by CLAUDE_TIMEOUT", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const delta = '{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"x"}}}';
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, TOOL_USE_THEN_REPEAT: delta, OCP_TOOL_TURN_QUIESCE_MS: "1000", CLAUDE_TIMEOUT: "3000" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const t0 = Date.now();
+      const r = await ltPostStatus(port, { model: "sonnet", tools: PAR_TOOLS, messages: [{ role: "user", content: "one please" }] });
+      const took = Date.now() - t0;
+      assert.equal(r.status, 500, `the turn must end on the timeout, not on quiescence — ${r.text.slice(0, 200)}`);
+      assert.match(r.text, /timed out/);
+      assert.ok(took >= 3000 && took < 10000, `took ${took} ms against a 3000 ms timeout`);
+      assert.doesNotMatch(buf.err, /"endedOn":"quiescence"/, `— ${buf.err.slice(-400)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "delta-loop", 8000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The request is answered at the timeout, but a child that ignores SIGTERM keeps writing until the
+// SIGKILL 5 s later, and neither trigger may end a turn the timeout already answered. The calls run
+// to ~2 s against a 1.5 s timeout and then stop. Without a final line the silence lets the window
+// expire after the timeout; with one the signal itself arrives late. The reap is awaited LAST so
+// the child is proven alive across both.
+const END_SIGNAL_LINE = '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null}}}';
+for (const [label, finalLine] of [["window", ""], ["signal", END_SIGNAL_LINE]]) {
+  ltTest(`integration (quiescence): the ${label} of a child that survives the timeout cannot end the answered turn`, async () => {
+    if (!LT_POSIX) return;
+    const dir = ltMkdir(); const fake = ltFake(dir);
+    try {
+      const call = '{"type":"assistant","message":{"id":"msg_fake01","stop_reason":null,"content":[{"type":"tool_use","id":"toolu_fakeB","name":"mcp__ocp__lookup_deploy_id","input":{"project":"alpha"}}]}}';
+      const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, TOOL_USE_THEN_REPEAT: call, TOOL_USE_REPEAT_COUNT: "10", TOOL_USE_FINAL_LINE: finalLine, TOOL_USE_SURVIVE_TERM: "1", OCP_TOOL_TURN_QUIESCE_MS: "1000", CLAUDE_TIMEOUT: "1500" }, dir);
+      try {
+        assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+        const r = await ltPostStatus(port, { model: "sonnet", tools: PAR_TOOLS, messages: [{ role: "user", content: "both please" }] });
+        assert.equal(r.status, 500, r.text.slice(0, 200));
+        assert.match(r.text, /timed out/);
+        await new Promise((done) => setTimeout(done, 2000));
+        assert.doesNotMatch(buf.out, /claude_reaped_after_timeout/, `the child must outlive both triggers or this proves nothing — ${buf.out.slice(-400)}`);
+        assert.ok(await ltWait(() => buf.out.includes("claude_reaped_after_timeout")), `the SIGKILL must still land — ${ltDiag(buf)}`);
+        // Read AFTER the reap: on a slow host a trigger could land after any earlier reading.
+        assert.doesNotMatch(buf.out + buf.err, /"openai_tool_calls"/, `— ${(buf.out + buf.err).slice(-400)}`);
+        const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+        assert.equal(h.stats.toolCallsEmitted, 0, "a timed-out request emitted no tool turn");
+      } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, `survive-term-${label}`, 8000); }
+    } finally { _ltRmRetry(dir); }
+  });
+}
 
 // ── #474: a timeout that never answers the client is a hang, not a timeout ────────────────────
 //

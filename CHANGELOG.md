@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A parallel tool call is no longer cut off because its arguments take longer to write than `OCP_TOOL_TURN_QUIESCE_MS`.** The window was armed once, on the first `tool_use`, and never re-armed, so it measured time since that call rather than silence: when it expired, the turn ended on `quiescence` while the model was still writing the next block, and the client received the first calls with no error. Each `tool_use` and `content_block_start` / `content_block_delta` / `content_block_stop` event now re-arms it. Other stream events, `ping` and `message_delta` included, do not: they do not show that more content is coming. A message that never stops writing now fails at `CLAUDE_TIMEOUT` rather than returning a partial turn, and a child that survives SIGTERM after the timeout can no longer end a turn the timeout already answered. A pause longer than the budget still ends the turn with what was collected. **Class B.1** (`/v1/chat/completions` `tool_calls`, ADR 0006, ADR 0022 § Decision 4); paths without tools are unchanged.
+
 ## v3.43.0 — 2026-10-29
 
 ### Added
